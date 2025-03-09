@@ -56,12 +56,14 @@ uint8_t getTcpState(uint8_t instance)
 // Must be an IP packet
 bool isTcp(etherHeader* ether)
 {
+    if (!isIp(ether))
+        return false;
     ipHeader *ip = (ipHeader*)ether->data;
     uint8_t ipHeaderLength = ip->size * 4;
     tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
     bool ok;
     uint16_t tmp16;
-    uint32_t sum = 0;
+    uint32_t sum = 0;  
     uint16_t tcpLength = ntohs(ip->length)-ipHeaderLength;
     ok = (ip->protocol == PROTOCOL_TCP);
     if (ok)
@@ -80,20 +82,93 @@ bool isTcp(etherHeader* ether)
 
 bool isTcpSyn(etherHeader *ether)
 {
-    return false;
+    // check if SYN flag is set
+    ipHeader *ip = (ipHeader*)ether->data;
+    uint8_t ipHeaderLength = ip->size * 4;
+    tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
+    return (tcp->offsetFields & 0xF) == SYN; // check SYN flag
 }
 
 bool isTcpAck(etherHeader *ether)
 {
-    return false;
+    // check if ACK flag is set
+    ipHeader *ip = (ipHeader*)ether->data;
+    uint8_t ipHeaderLength = ip->size * 4;
+    tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
+    return (tcp->offsetFields & 0xF) == ACK; // check ACK flag
 }
 
 void sendTcpPendingMessages(etherHeader *ether)
 {
+    //check if any of the TCP ports have pending messages
+    uint8_t i;
+    for (i = 0; i < tcpPortCount; i++)
+    {
+        uint8_t state = getTcpState(i);
+        if (state == TCP_SYN_SENT)
+        {
+            sendTcpMessage(ether, s, SYN, NULL, 0);
+        }
+        else if (state == TCP_ESTABLISHED)
+        {
+            sendTcpMessage(ether, s, ACK, NULL, 0);
+        }
+        else if (state == TCP_FIN_WAIT_1)
+        {
+            sendTcpMessage(ether, s, FIN | ACK, NULL, 0);
+        }
+        else if (state == TCP_FIN_WAIT_2)
+        {
+            sendTcpMessage(ether, s, FIN | ACK, NULL, 0);
+        }
+        else if (state == TCP_TIME_WAIT)
+        {
+            sendTcpMessage(ether, s, FIN | ACK, NULL, 0);
+        }
+    }
+
 }
 
 void processTcpResponse(etherHeader *ether)
 {
+    // take in response and update TCP state machine
+    ipHeader *ip = (ipHeader*)ether->data;
+    uint8_t ipHeaderLength = ip->size * 4;
+    tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
+
+    // just checking
+    if (!isTcp(ether)) return;
+    if (!isTcpPortOpen(ether)) return;
+
+    // find which instance the response is for
+    uint8_t i;
+    for (i = 0; i < tcpPortCount; i++)
+    {
+        if (tcpPorts[i] == ntohs(tcp->destPort))
+            break;
+    }
+
+    // move to state based on flags
+    if (tcp->flags & (SYN | ACK))
+    {
+        setTcpState(i, TCP_ESTABLISHED);
+    }
+    else if (tcp->flags & FIN)
+    {
+        setTcpState(i, TCP_FIN_WAIT_1);
+    }
+    else if (tcp->flags & ACK)
+    {
+        uint8_t state = getTcpState(i);
+        if (state == TCP_FIN_WAIT_1)
+        {
+            setTcpState(i, TCP_FIN_WAIT_2);
+        }
+        else if (state == TCP_FIN_WAIT_2)
+        {
+            setTcpState(i, TCP_TIME_WAIT);
+        }
+    }
 }
 
 void processTcpArpResponse(etherHeader *ether)
@@ -102,15 +177,34 @@ void processTcpArpResponse(etherHeader *ether)
 
 void setTcpPortList(uint16_t ports[], uint8_t count)
 {
+    tcpPortCount = count;
+    uint8_t i;
+    for (i = 0; i < count; i++)
+    {
+        tcpPorts[i] = ports[i];
+    }
 }
 
 bool isTcpPortOpen(etherHeader *ether)
 {
+    uint8_t i;
+    ipHeader *ip = (ipHeader*)ether->data;
+    uint8_t ipHeaderLength = ip->size * 4;
+    tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
+    // check if destination port is in the list
+    uint16_t destPort = ntohs(tcp->destPort);
+    for (i = 0; i < tcpPortCount; i++)
+    {
+        if (destPort == tcpPorts[i])
+            return true;
+    }
     return false;
 }
 
 void sendTcpResponse(etherHeader *ether, socket* s, uint16_t flags)
 {
+    //similar to sendTcpMessage
+    
 }
 
 // Send TCP message
