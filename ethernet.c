@@ -479,6 +479,7 @@ int main(void)
                     {
                         if (isTcpPortOpen(data))
                         {
+                            // MQTT processing
                         }
                         else
                             sendTcpResponse(data, &s, ACK | RST);

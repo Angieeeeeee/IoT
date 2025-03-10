@@ -56,8 +56,7 @@ uint8_t getTcpState(uint8_t instance)
 // Must be an IP packet
 bool isTcp(etherHeader* ether)
 {
-    if (!isIp(ether))
-        return false;
+    if (!isIp(ether)) return false;
     ipHeader *ip = (ipHeader*)ether->data;
     uint8_t ipHeaderLength = ip->size * 4;
     tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
@@ -126,7 +125,6 @@ void sendTcpPendingMessages(etherHeader *ether)
             sendTcpMessage(ether, s, FIN | ACK, NULL, 0);
         }
     }
-
 }
 
 void processTcpResponse(etherHeader *ether)
@@ -173,6 +171,18 @@ void processTcpResponse(etherHeader *ether)
 
 void processTcpArpResponse(etherHeader *ether)
 {
+    // take in arp response and update TCP state machine
+    arpPacket *arp = (arpPacket*)ether->data;
+    uint8_t i;
+    for (i = 0; i < tcpPortCount; i++)
+    {
+        if (arp->sourceIp == tcpPorts[i])
+            break;
+    }
+    setTcpState(i, TCP_SYN_SENT);
+
+    // send SYN
+    sendTcpMessage(ether, s, SYN, NULL, 0);
 }
 
 void setTcpPortList(uint16_t ports[], uint8_t count)
@@ -191,6 +201,7 @@ bool isTcpPortOpen(etherHeader *ether)
     ipHeader *ip = (ipHeader*)ether->data;
     uint8_t ipHeaderLength = ip->size * 4;
     tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
+    
     // check if destination port is in the list
     uint16_t destPort = ntohs(tcp->destPort);
     for (i = 0; i < tcpPortCount; i++)
@@ -204,7 +215,65 @@ bool isTcpPortOpen(etherHeader *ether)
 void sendTcpResponse(etherHeader *ether, socket* s, uint16_t flags)
 {
     //similar to sendTcpMessage
-    
+    uint8_t i;
+    uint16_t j;
+    uint32_t sum;
+    uint16_t tmp16;
+    uint16_t tcpLength;
+    uint8_t localHwAddress[6];
+    uint8_t localIpAddress[4];
+
+    // Ether frame
+    getEtherMacAddress(localHwAddress);
+    getIpAddress(localIpAddress);
+    for (i = 0; i < HW_ADD_LENGTH; i++)
+    {
+        ether->destAddress[i] = s->remoteHwAddress[i];
+        ether->sourceAddress[i] = localHwAddress[i];
+    }
+    ether->frameType = htons(TYPE_IP);
+
+    // IP header
+    ipHeader* ip = (ipHeader*)ether->data;
+    ip->rev = 0x4;
+    ip->size = 0x5;
+    ip->typeOfService = 0;
+    ip->length = htons(sizeof(ipHeader) + sizeof(tcpHeader));
+    ip->id = 0;
+    ip->flagsAndOffset = 0;
+    ip->ttl = 128;
+    ip->protocol = PROTOCOL_TCP;
+    ip->headerChecksum = 0;
+    for (i = 0; i < IP_ADD_LENGTH; i++)
+    {
+        ip->destIp[i] = s->remoteIpAddress[i];
+        ip->sourceIp[i] = localIpAddress[i];
+    }
+    uint8_t ipHeaderLength = ip->size * 4;
+
+    // TCP header
+    tcpHeader* tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
+    tcp->sourcePort = htons(s->localPort);
+    tcp->destPort = htons(s->remotePort);
+    tcp->sequenceNumber = htonl(s->sequenceNumber);
+    tcp->acknowledgementNumber = htonl(s->acknowledgementNumber);
+    tcp->offsetFields = htons((0x5 << 12) | flags);
+    tcp->windowSize = htons(0x2000);
+    tcp->checksum = 0;
+    tcp->urgentPointer = 0;
+
+    // Calculate checksum
+    tcpLength = sizeof(tcpHeader);
+    sum = 0;
+    sumIpWords(ip->sourceIp, 8, &sum);
+    tmp16 = ip->protocol;
+    sum += (tmp16 & 0xff) << 8;
+    sumIpWords(&tcpLength, 2, &sum);
+    sumIpWords(tcp, tcpLength, &sum);
+    tcp->checksum = getIpChecksum(sum);
+
+    // Send packet
+    putEtherPacket(ether, sizeof(etherHeader) + ipHeaderLength + tcpLength);
 }
 
 // Send TCP message
@@ -272,7 +341,7 @@ void sendTcpMessage(etherHeader *ether, socket *s, uint16_t flags, uint8_t data[
  
     // data offset and flags
     uint8_t dataOffset = 0x5; // 20 bytes (standard idk)
-    uint16_t offsetsFlag = (dataOffset & 0xF) << 12 | (flags & 0xFFF);
+    uint16_t offsetsFlag = (dataOffset & 0xF) << OFS_SHIFT | (flags & 0xFFF);
     tcp->offsetFields = htons(offsetsFlags);
  
     // window
