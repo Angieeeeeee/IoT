@@ -435,6 +435,9 @@ int main(void)
     setPinValue(GREEN_LED, 0);
     waitMicrosecond(100000);
 
+    // initialize client as closed
+    setTcpState(0, TCP_CLOSED);
+
     // Main Loop
     // RTOS and interrupts would greatly improve this code,
     // but the goal here is simplicity
@@ -479,7 +482,7 @@ int main(void)
                     {
                         if (isTcpPortOpen(data))
                         {
-                            // MQTT processing
+                            
                         }
                         else
                             sendTcpResponse(data, &s, ACK | RST);
