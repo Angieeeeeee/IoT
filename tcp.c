@@ -1,5 +1,6 @@
 // TCP Library (includes framework only)
 // Jason Losh
+// Edits by Angelina Abuhilal 1002108627
 
 //-----------------------------------------------------------------------------
 // Hardware Target
@@ -31,7 +32,7 @@
 uint16_t tcpPorts[MAX_TCP_PORTS];
 uint8_t tcpPortCount = 0;
 uint8_t tcpState[MAX_TCP_PORTS];
-socket  sockets[MAX_TCP_PORTS];
+socket sockets[MAX_TCP_PORTS];
 
 // ------------------------------------------------------------------------------
 //  Structures
@@ -53,7 +54,7 @@ uint8_t getTcpState(uint8_t instance)
     return tcpState[instance];
 }
 
-// Get socket 
+// Get socket
 socket *getsocket(uint8_t instance)
 {
     return &sockets[instance];
@@ -69,7 +70,7 @@ bool isTcp(etherHeader* ether)
     tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
     bool ok;
     uint16_t tmp16;
-    uint32_t sum = 0;  
+    uint32_t sum = 0;
     uint16_t tcpLength = ntohs(ip->length)-ipHeaderLength;
     ok = (ip->protocol == PROTOCOL_TCP);
     if (ok)
@@ -93,7 +94,8 @@ bool isTcpSyn(etherHeader *ether)
     uint8_t ipHeaderLength = ip->size * 4;
     tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
     uint16_t offsetfields = ntohs(tcp->offsetFields);
-    return (offsetfields & 0xFF) == SYN; // check SYN flag
+    bool ok = offsetfields & SYN; // AND with SYN flag
+    return ok;
 }
 
 bool isTcpAck(etherHeader *ether)
@@ -103,33 +105,41 @@ bool isTcpAck(etherHeader *ether)
     uint8_t ipHeaderLength = ip->size * 4;
     tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
     uint16_t offsetfields = ntohs(tcp->offsetFields);
-    return (offsetFields & 0xFF) == ACK; // check ACK flag
+    bool ok = (offsetfields & ACK) == ACK; // AND with ACK flag
+    return ok;
 }
 
 void sendTcpPendingMessages(etherHeader *ether)
 {
     // put tcp state machine here
-    // when in closed: send ARP request and start a timer and resend if timer expires
-    // when in ARP_SENT: record socket SYN, send SYN, start a timer and resend if timer expires and open port
+
+    // when in CLOSED: send ARP request and start a timer, if ARP response is received, open port and send SYN
     // when in SYN_SENT: SYN/ACK rx -> send ACK, start a timer and resend if timer expires
-    // when in ESTABLISHED: send data, start a timer and resend if timer expires
+    // when in ESTABLISHED: process incoming data, if FIN flag is sent start closing
+    // when in CLOSE_WAIT: send FIN ACK
+    // when in LAST_ACK: wait for ACK and close socket
+
     // set initial state to closed then call for sendTcpPendingMessages
     uint8_t state = getTcpState(0);
     switch (state)
     {
-        case TCP_CLOSED:
-            // send ARP request or process ARP response
+        // am i alwyas trying to get out of the closed state?
+        case TCP_CLOSED: // send ARP request or process ARP response
             if (isArpResponse(ether))
             {
-                processTcpArpResponse(ether);
                 // makes socket and switches to SYN_SENT
+                processTcpArpResponse(ether);
+                sendTcpMessage(ether, getsocket(0), SYN, NULL, 0);
             }
             else
             {
-                // resend ARP request
-                // placeholder functions till i understand how they work 
-                sendArpRequest(ether, myIP ,mqttBrokerIp); // how do i get IPs
-                startOneshotTimer(callback, TIMEOUT_PERIOD);
+                // send ARP request to MQTT broker
+                uint8_t ip[4];
+                getIpAddress(ip);
+                uint8_t mqttip[4];
+                getIpMqttBrokerAddress(mqttip);
+                sendArpRequest(ether, ip, mqttip);
+                //startOneshotTimer(callback, TIMEOUT_PERIOD);
             }
             break;
         case TCP_SYN_SENT:
@@ -137,20 +147,16 @@ void sendTcpPendingMessages(etherHeader *ether)
             // i sent a SYN and this sees if i got a SYN/ACK back
             if (isTcpSyn(ether) && isTcpAck(ether))
             {
-                processTcpResponse(ether);
-                // send ACK
-                sendTcpResponse(ether, getsocket(0), ACK);
+                processTcpResponse(ether); // update socket info and send ACK
                 // start timer
-                startOneshotTimer(callback, TIMEOUT_PERIOD);
+                //startOneshotTimer(callback, TIMEOUT_PERIOD);
                 // switch to established
                 setTcpState(0, TCP_ESTABLISHED);
             }
             break;
-        case TCP_SYN_RECEIVED:
-            // idk what this state is for
-            break;
         case TCP_ESTABLISHED:
-            // send data
+            // send and receive data
+            //startOneshotTimer(callback, TIMEOUT_PERIOD);
             // if the flag is RST or FIN, close the connection
             if (isTcp(ether))
             {
@@ -158,19 +164,34 @@ void sendTcpPendingMessages(etherHeader *ether)
                 uint8_t ipHeaderLength = ip->size * 4;
                 tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
                 uint16_t offsetFields = ntohs(tcp->offsetFields);
-                if (offsetFields & RST || offsetFields & FIN)
+                if (offsetFields & FIN)
+                {
+                    setTcpState(0, TCP_CLOSE_WAIT);
+                }
+                else if (offsetFields & RST)
                 {
                     setTcpState(0, TCP_CLOSED);
+                }
+                else
+                {
+                    processTcpResponse(ether); // get server data
                 }
             }
             break;
         case TCP_CLOSE_WAIT:
-            break;
-        case TCP_CLOSING:
+            // send FIN ACK
+            sendTcpMessage(ether, getsocket(0), FIN | ACK, NULL, 0);
+            // start timer
+            //startOneshotTimer(callback, TIMEOUT_PERIOD);
+            setTcpState(0, TCP_LAST_ACK);
             break;
         case TCP_LAST_ACK:
-            break;
-        case TCP_TIME_WAIT:
+            // check if ACK
+            if (isTcp(ether) && isTcpAck(ether))
+            {
+                setTcpState(0, TCP_CLOSED);
+                // close socket and free memory
+            }
             break;
         default:
             setTcpState(0, TCP_CLOSED);
@@ -180,68 +201,71 @@ void sendTcpPendingMessages(etherHeader *ether)
 
 void processTcpResponse(etherHeader *ether)
 {
+    // just checking
+    if (!isTcp(ether)) return;
+
     // change window size in socket and check if ack number is correct
     ipHeader *ip = (ipHeader*)ether->data;
     uint8_t ipHeaderLength = ip->size * 4;
     tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
 
-    // just checking
-    if (!isTcp(ether)) return;
-
-    // update window size
+    // update socket info for future messages
     socket *s = getsocket(0);
 
-    if (tcp->acknowledgementNumber == s->sequenceNumber) // ack number needs to be syn + data size
+    // update ack number when data is received
+    uint16_t dataSize = ntohs(ip->length) - ipHeaderLength - sizeof(tcpHeader);
+    if (dataSize > 0)
+        s->acknowledgementNumber += dataSize; // update ack number
+    else
+        s->acknowledgementNumber += 1; // no data, just increment by 1
+
+    if (tcp->sequenceNumber == s->acknowledgementNumber) // ack number needs to be syn + data size seq number updated in socket when data is sent
     {
         s->sequenceNumber = tcp->acknowledgementNumber;
-        s->windowSize = tcp->windowSize;
+
+        // check if data is present and process it
+        uint16_t dataSize = ntohs(ip->length) - ipHeaderLength - sizeof(tcpHeader);
+        if (dataSize > 0)
+        {
+            // process data here
+            uint8_t *data = tcp->data;
+            // MQTT happens here 
+        }
     }
+    sendTcpMessage(ether, s, ACK, NULL, 0); // send ACK back to server
 }
 
 void processTcpArpResponse(etherHeader *ether)
 {
-    // take in arp response and update TCP state machine
+    // take in arp response
     arpPacket *arp = (arpPacket*)ether->data;
     // if its from mqtt broker, set state to SYN_SENT and make socket
-    if (!(arp->sourceIp == mqttBrokerIp)) return;
+    uint8_t mqttip[4];
+    getIpMqttBrokerAddress(mqttip);
+    if (!(arp->sourceIp == mqttip)) return;
+    
     setTcpState(0, TCP_SYN_SENT);
     // populate socket
     socket *s = getsocket(0);
-    /*
-    typedef struct _socket
-    {
-    uint8_t remoteIpAddress[4];
-    uint8_t remoteHwAddress[6];
-    uint16_t remotePort;
-    uint16_t localPort;
-    uint32_t sequenceNumber;
-    uint32_t acknowledgementNumber;
-    uint8_t  state;
-    } socket;
 
-    typedef struct _arpPacket // 28 bytes
+    // loop to populate both 
+    uint8_t i;
+    uint8_t j;
+    for (i = 0; i < 4; i++)
     {
-    uint16_t hardwareType;
-    uint16_t protocolType;
-    uint8_t hardwareSize;
-    uint8_t protocolSize;
-    uint16_t op;
-    uint8_t sourceAddress[6];
-    uint8_t sourceIp[4];
-    uint8_t destAddress[6];
-    uint8_t destIp[4];
-    } arpPacket;
-    */
-    s->remoteIpAddress = arp->sourceIp;
-    s->remoteHwAddress = arp->sourceAddress;
+        s->remoteIpAddress[i] = arp->destIp[i];
+    }
+    for (j = 0; j < 6; j++)
+    {
+        s->remoteHwAddress[j] = arp->destAddress[j];
+    }
+
     s->remotePort = 1883; // MQTT hard coded
-    s->localPort = 1883; // MQTT hard coded
-    s->sequenceNumber = 0;
-    s->acknowledgementNumber = 0;
-    //s->state = TCP_SYN_SENT; idk about the state 
-
-    //send SYN
-    sendTcpMessage(ether, s, SYN, NULL, 0);
+    // local port is uint16_t 
+    s->localPort = 49152; // random port number
+    s->sequenceNumber = random32(); // random number for initial sequence number
+    s->acknowledgementNumber = 0; // calcule ack number when data is sent
+    s->state = getTcpState(0);
 }
 
 void setTcpPortList(uint16_t ports[], uint8_t count)
@@ -256,20 +280,21 @@ void setTcpPortList(uint16_t ports[], uint8_t count)
 
 bool isTcpPortOpen(etherHeader *ether)
 {
-    uint8_t i;
     ipHeader *ip = (ipHeader*)ether->data;
     uint8_t ipHeaderLength = ip->size * 4;
     tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
-    
+
     // check if destination port is in the list
     uint16_t destPort = ntohs(tcp->destPort);
     if (destPort == 1883) return true; // MQTT hard coded
     return false;
 }
 
+// so far i dont use this function
 void sendTcpResponse(etherHeader *ether, socket* s, uint16_t flags)
 {
     // send TCP response based on flags and no data transfer
+
     // not TCP packet case
     if (!isTcp(ether)) return;
     // not open port case
@@ -291,8 +316,8 @@ void sendTcpMessage(etherHeader *ether, socket *s, uint16_t flags, uint8_t data[
      *              source port | destination port (same as UDP)
      *               sequence number (from ether)
      *                   ACK number (from ether)
-     *  data offset OR ack flag | window 
-     *                 checksum | urgent pointer 
+     *  data offset OR ack flag | window
+     *                 checksum | urgent pointer
      *
      */
     uint8_t i;
@@ -303,7 +328,7 @@ void sendTcpMessage(etherHeader *ether, socket *s, uint16_t flags, uint8_t data[
     uint8_t *copyData;
     uint8_t localHwAddress[6];
     uint8_t localIpAddress[4];
- 
+
     // Ether frame
     getEtherMacAddress(localHwAddress);
     getIpAddress(localIpAddress);
@@ -313,7 +338,7 @@ void sendTcpMessage(etherHeader *ether, socket *s, uint16_t flags, uint8_t data[
         ether->sourceAddress[i] = localHwAddress[i];
     }
     ether->frameType = htons(TYPE_IP);
- 
+
     // IP header
     ipHeader* ip = (ipHeader*)ether->data; // up to here, ether is populated
     ip->rev = 0x4;
@@ -334,27 +359,32 @@ void sendTcpMessage(etherHeader *ether, socket *s, uint16_t flags, uint8_t data[
         ip->sourceIp[i] = localIpAddress[i];
     }
     uint8_t ipHeaderLength = ip->size * 4;
- 
+
     // real work here boys
     //        |
     //        V
     // populating tcp header
 
-    // extracting from socket 
+    if (dataSize > 0)
+        s->sequenceNumber += dataSize; // update sequence number
+    else
+        s->sequenceNumber += 1; // no data, just increment by 1
+
+    // extracting from socket
     tcpHeader* tcp = (tcpHeader*)((uint8_t*)ip + (ip->size * 4));
     tcp->sourcePort = htons(s->localPort);
     tcp->destPort = htons(s->remotePort);
     tcp->sequenceNumber = htons(s->sequenceNumber);
     tcp->acknowledgementNumber = htons(s->acknowledgementNumber);
- 
+
     // data offset and flags
-    uint8_t dataOffset = 0x5; // 20 bytes (standard idk)
-    uint16_t offsetsFlag = (dataOffset & 0xF) << OFS_SHIFT | (flags & 0xFFF);
+    uint8_t dataOffset = 20; // TCP header size
+    uint16_t offsetsFlags = (dataOffset & 0xF) << OFS_SHIFT | (flags & 0xFFF);
     tcp->offsetFields = htons(offsetsFlags);
- 
-    // get window size from initial sequence number from server 
-    tcp->windowSize = htons(s->windowSize);
- 
+
+    // IS THE WINDOW HARD CODED?
+    tcp->windowSize = htons(0xFFFF); // max window size
+
     //checksum
     tcpLength = ntohs(ip->length)-ipHeaderLength;
     copyData = tcp->data;
@@ -368,12 +398,12 @@ void sendTcpMessage(etherHeader *ether, socket *s, uint16_t flags, uint8_t data[
     sumIpWords(&tcpLength, 2, &sum);
     // add tcp header
     tcp->checksum = 0;
-    sumIpWords(udp, udpLength, &sum);
+    sumIpWords(tcp, tcpLength, &sum);
     tcp->checksum = getIpChecksum(sum);
 
     // urgent pointer (padded cause idk where to get this)
     tcp->urgentPointer = 0;
- 
+
     // send packet with size = ether + udp hdr + ip header + udp_size
     putEtherPacket(ether, sizeof(etherHeader) + ipHeaderLength + tcpLength);
 }
