@@ -446,6 +446,19 @@ int main(void)
         // Terminal processing here
         processShell();
 
+        // write code snipit to check if send tcp message is working
+        socket *test = getsocket(0);
+        test->remoteIpAddress[0] = 192;
+        test->remoteIpAddress[1] = 168;
+        test->remoteIpAddress[2] = 1;
+        test->remoteIpAddress[3] = 1;
+        test->remotePort = 80;
+        test->localPort = 49152;
+        test->sequenceNumber = random32();
+        test->acknowledgementNumber = 0;
+        test->state = getTcpState(0);
+        sendTcpMessage(data, test, SYN, NULL, 0);
+
         // TCP pending messages
         sendTcpPendingMessages(data);
 

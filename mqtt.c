@@ -35,20 +35,31 @@
 
 void connectMqtt()
 {
+    // connect to MQTT broker
+    // send CONNECT message
+    // send CONNACK message
+
 }
 
 void disconnectMqtt()
 {
+
+
 }
 
 void publishMqtt(char strTopic[], char strData[])
 {
+
 }
 
 void subscribeMqtt(char strTopic[])
 {
+    // send SUBSCRIBE message
+    // send SUBACK message
+
 }
 
 void unsubscribeMqtt(char strTopic[])
 {
+    
 }

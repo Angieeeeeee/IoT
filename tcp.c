@@ -1,409 +1,1118 @@
-// TCP Library (includes framework only)
+// Ethernet Framework for Projects 1 and 2
+// Spring 2025
 // Jason Losh
-// Edits by Angelina Abuhilal 1002108627
 
 //-----------------------------------------------------------------------------
 // Hardware Target
 //-----------------------------------------------------------------------------
 
-// Target Platform: -
-// Target uC:       -
-// System Clock:    -
+// Target Platform: EK-TM4C123GXL w/ ENC28J60
+// Target uC:       TM4C123GH6PM
+// System Clock:    40 MHz
 
 // Hardware configuration:
-// -
+// ENC28J60 Ethernet controller on SPI0
+//   MOSI (SSI0Tx) on PA5
+//   MISO (SSI0Rx) on PA4
+//   SCLK (SSI0Clk) on PA2
+//   ~CS (SW controlled) on PA3
+//   WOL on PB3
+//   INT on PC6
+
+// Pinning for IoT projects with wireless modules:
+// N24L01+ RF transceiver
+//   MOSI (SSI0Tx) on PA5
+//   MISO (SSI0Rx) on PA4
+//   SCLK (SSI0Clk) on PA2
+//   ~CS on PE0
+//   INT on PB2
+// Xbee module
+//   DIN (UART1TX) on PC5
+//   DOUT (UART1RX) on PC4
 
 //-----------------------------------------------------------------------------
 // Device includes, defines, and assembler directives
 //-----------------------------------------------------------------------------
 
+#include <inttypes.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
-#include "arp.h"
-#include "tcp.h"
+#include <ctype.h>
+#include "tm4c123gh6pm.h"
+#include "clock.h"
+#include "eeprom.h"
+#include "gpio.h"
+#include "spi0.h"
+#include "uart0.h"
+#include "wait.h"
 #include "timer.h"
+#include "eth0.h"
+#include "arp.h"
+#include "ip.h"
+#include "icmp.h"
+#include "udp.h"
+#include "tcp.h"
+#include "mqtt.h"
 
-// ------------------------------------------------------------------------------
-//  Globals
-// ------------------------------------------------------------------------------
+// Pins
+#define RED_LED PORTF,1
+#define BLUE_LED PORTF,2
+#define GREEN_LED PORTF,3
+#define PUSH_BUTTON PORTF,4
 
-#define MAX_TCP_PORTS 4
-
-uint16_t tcpPorts[MAX_TCP_PORTS];
-uint8_t tcpPortCount = 0;
-uint8_t tcpState[MAX_TCP_PORTS];
-socket sockets[MAX_TCP_PORTS];
-
-// ------------------------------------------------------------------------------
-//  Structures
-// ------------------------------------------------------------------------------
+// EEPROM Map
+#define EEPROM_DHCP        1
+#define EEPROM_IP          2
+#define EEPROM_SUBNET_MASK 3
+#define EEPROM_GATEWAY     4
+#define EEPROM_DNS         5
+#define EEPROM_TIME        6
+#define EEPROM_MQTT        7
+#define EEPROM_ERASED      0xFFFFFFFF
 
 //-----------------------------------------------------------------------------
-// Subroutines
+// Subroutines                
 //-----------------------------------------------------------------------------
 
-// Set TCP state
-void setTcpState(uint8_t instance, uint8_t state)
+// Initialize Hardware
+void initHw()
 {
-    tcpState[instance] = state;
+    // Initialize system clock to 40 MHz
+    initSystemClockTo40Mhz();
+
+    // Enable clocks
+    enablePort(PORTF);
+    _delay_cycles(3);
+
+    // Configure LED and pushbutton pins
+    selectPinPushPullOutput(RED_LED);
+    selectPinPushPullOutput(GREEN_LED);
+    selectPinPushPullOutput(BLUE_LED);
+    selectPinDigitalInput(PUSH_BUTTON);
+    enablePinPullup(PUSH_BUTTON);
 }
 
-// Get TCP state
-uint8_t getTcpState(uint8_t instance)
+void displayConnectionInfo()
 {
-    return tcpState[instance];
-}
-
-// Get socket
-socket *getsocket(uint8_t instance)
-{
-    return &sockets[instance];
-}
-
-// Determines whether packet is TCP packet
-// Must be an IP packet
-bool isTcp(etherHeader* ether)
-{
-    if (!isIp(ether)) return false;
-    ipHeader *ip = (ipHeader*)ether->data;
-    uint8_t ipHeaderLength = ip->size * 4;
-    tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
-    bool ok;
-    uint16_t tmp16;
-    uint32_t sum = 0;
-    uint16_t tcpLength = ntohs(ip->length)-ipHeaderLength;
-    ok = (ip->protocol == PROTOCOL_TCP);
-    if (ok)
-    {
-        // 32-bit sum over pseudo-header
-        sumIpWords(ip->sourceIp, 8, &sum);
-        tmp16 = ip->protocol;
-        sum += (tmp16 & 0xff) << 8;
-        sumIpWords(&tcpLength, 2, &sum);
-        // add tcp header and data
-        sumIpWords(tcp, tcpLength, &sum);
-        ok = (getIpChecksum(sum) == 0);
-    }
-    return ok;
-}
-
-bool isTcpSyn(etherHeader *ether)
-{
-    // check if SYN flag is set
-    ipHeader *ip = (ipHeader*)ether->data;
-    uint8_t ipHeaderLength = ip->size * 4;
-    tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
-    uint16_t offsetfields = ntohs(tcp->offsetFields);
-    bool ok = offsetfields & SYN; // AND with SYN flag
-    return ok;
-}
-
-bool isTcpAck(etherHeader *ether)
-{
-    // check if ACK flag is set
-    ipHeader *ip = (ipHeader*)ether->data;
-    uint8_t ipHeaderLength = ip->size * 4;
-    tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
-    uint16_t offsetfields = ntohs(tcp->offsetFields);
-    bool ok = (offsetfields & ACK) == ACK; // AND with ACK flag
-    return ok;
-}
-
-void sendTcpPendingMessages(etherHeader *ether)
-{
-    // put tcp state machine here
-
-    // when in CLOSED: send ARP request and start a timer, if ARP response is received, open port and send SYN
-    // when in SYN_SENT: SYN/ACK rx -> send ACK, start a timer and resend if timer expires
-    // when in ESTABLISHED: process incoming data, if FIN flag is sent start closing
-    // when in CLOSE_WAIT: send FIN ACK
-    // when in LAST_ACK: wait for ACK and close socket
-
-    // set initial state to closed then call for sendTcpPendingMessages
-    uint8_t state = getTcpState(0);
-    switch (state)
-    {
-        // am i alwyas trying to get out of the closed state?
-        case TCP_CLOSED: // send ARP request or process ARP response
-            if (isArpResponse(ether))
-            {
-                // makes socket and switches to SYN_SENT
-                processTcpArpResponse(ether);
-                sendTcpMessage(ether, getsocket(0), SYN, NULL, 0);
-            }
-            else
-            {
-                // send ARP request to MQTT broker
-                uint8_t ip[4];
-                getIpAddress(ip);
-                uint8_t mqttip[4];
-                getIpMqttBrokerAddress(mqttip);
-                sendArpRequest(ether, ip, mqttip);
-                //startOneshotTimer(callback, TIMEOUT_PERIOD);
-            }
-            break;
-        case TCP_SYN_SENT:
-            if (!isTcp(ether)) return;
-            // i sent a SYN and this sees if i got a SYN/ACK back
-            if (isTcpSyn(ether) && isTcpAck(ether))
-            {
-                processTcpResponse(ether); // update socket info and send ACK
-                // start timer
-                //startOneshotTimer(callback, TIMEOUT_PERIOD);
-                // switch to established
-                setTcpState(0, TCP_ESTABLISHED);
-            }
-            break;
-        case TCP_ESTABLISHED:
-            // send and receive data
-            //startOneshotTimer(callback, TIMEOUT_PERIOD);
-            // if the flag is RST or FIN, close the connection
-            if (isTcp(ether))
-            {
-                ipHeader *ip = (ipHeader*)ether->data;
-                uint8_t ipHeaderLength = ip->size * 4;
-                tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
-                uint16_t offsetFields = ntohs(tcp->offsetFields);
-                if (offsetFields & FIN)
-                {
-                    setTcpState(0, TCP_CLOSE_WAIT);
-                }
-                else if (offsetFields & RST)
-                {
-                    setTcpState(0, TCP_CLOSED);
-                }
-                else
-                {
-                    processTcpResponse(ether); // get server data
-                }
-            }
-            break;
-        case TCP_CLOSE_WAIT:
-            // send FIN ACK
-            sendTcpMessage(ether, getsocket(0), FIN | ACK, NULL, 0);
-            // start timer
-            //startOneshotTimer(callback, TIMEOUT_PERIOD);
-            setTcpState(0, TCP_LAST_ACK);
-            break;
-        case TCP_LAST_ACK:
-            // check if ACK
-            if (isTcp(ether) && isTcpAck(ether))
-            {
-                setTcpState(0, TCP_CLOSED);
-                // close socket and free memory
-            }
-            break;
-        default:
-            setTcpState(0, TCP_CLOSED);
-            break;
-    }
-}
-
-void processTcpResponse(etherHeader *ether)
-{
-    // just checking
-    if (!isTcp(ether)) return;
-
-    // change window size in socket and check if ack number is correct
-    ipHeader *ip = (ipHeader*)ether->data;
-    uint8_t ipHeaderLength = ip->size * 4;
-    tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
-
-    // update socket info for future messages
-    socket *s = getsocket(0);
-
-    // update ack number when data is received
-    uint16_t dataSize = ntohs(ip->length) - ipHeaderLength - sizeof(tcpHeader);
-    if (dataSize > 0)
-        s->acknowledgementNumber += dataSize; // update ack number
-    else
-        s->acknowledgementNumber += 1; // no data, just increment by 1
-
-    if (tcp->sequenceNumber == s->acknowledgementNumber) // ack number needs to be syn + data size seq number updated in socket when data is sent
-    {
-        s->sequenceNumber = tcp->acknowledgementNumber;
-
-        // check if data is present and process it
-        uint16_t dataSize = ntohs(ip->length) - ipHeaderLength - sizeof(tcpHeader);
-        if (dataSize > 0)
-        {
-            // process data here
-            uint8_t *data = tcp->data;
-            // MQTT happens here 
-        }
-    }
-    sendTcpMessage(ether, s, ACK, NULL, 0); // send ACK back to server
-}
-
-void processTcpArpResponse(etherHeader *ether)
-{
-    // take in arp response
-    arpPacket *arp = (arpPacket*)ether->data;
-    // if its from mqtt broker, set state to SYN_SENT and make socket
-    uint8_t mqttip[4];
-    getIpMqttBrokerAddress(mqttip);
-    if (!(arp->sourceIp == mqttip)) return;
-    
-    setTcpState(0, TCP_SYN_SENT);
-    // populate socket
-    socket *s = getsocket(0);
-
-    // loop to populate both 
     uint8_t i;
-    uint8_t j;
-    for (i = 0; i < 4; i++)
-    {
-        s->remoteIpAddress[i] = arp->destIp[i];
-    }
-    for (j = 0; j < 6; j++)
-    {
-        s->remoteHwAddress[j] = arp->destAddress[j];
-    }
-
-    s->remotePort = 1883; // MQTT hard coded
-    // local port is uint16_t 
-    s->localPort = 49152; // random port number
-    s->sequenceNumber = random32(); // random number for initial sequence number
-    s->acknowledgementNumber = 0; // calcule ack number when data is sent
-    s->state = getTcpState(0);
-}
-
-void setTcpPortList(uint16_t ports[], uint8_t count)
-{
-    tcpPortCount = count;
-    uint8_t i;
-    for (i = 0; i < count; i++)
-    {
-        tcpPorts[i] = ports[i];
-    }
-}
-
-bool isTcpPortOpen(etherHeader *ether)
-{
-    ipHeader *ip = (ipHeader*)ether->data;
-    uint8_t ipHeaderLength = ip->size * 4;
-    tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
-
-    // check if destination port is in the list
-    uint16_t destPort = ntohs(tcp->destPort);
-    if (destPort == 1883) return true; // MQTT hard coded
-    return false;
-}
-
-// so far i dont use this function
-void sendTcpResponse(etherHeader *ether, socket* s, uint16_t flags)
-{
-    // send TCP response based on flags and no data transfer
-
-    // not TCP packet case
-    if (!isTcp(ether)) return;
-    // not open port case
-    if (!isTcpPortOpen(ether))
-    {
-        sendTcpMessage(ether, s, RST, NULL, 0);
-        setTcpState(s->state, TCP_CLOSED);
-        return;
-    }
-    // send response flag
-    sendTcpMessage(ether, s, flags, NULL, 0);
-    // do i need to update window size, syn, ack, etc?
-}
-
-// Send TCP message
-void sendTcpMessage(etherHeader *ether, socket *s, uint16_t flags, uint8_t data[], uint16_t dataSize)
-{
-    /*
-     *              source port | destination port (same as UDP)
-     *               sequence number (from ether)
-     *                   ACK number (from ether)
-     *  data offset OR ack flag | window
-     *                 checksum | urgent pointer
-     *
-     */
-    uint8_t i;
-    uint16_t j;
-    uint32_t sum;
-    uint16_t tmp16;
-    uint16_t tcpLength;
-    uint8_t *copyData;
-    uint8_t localHwAddress[6];
-    uint8_t localIpAddress[4];
-
-    // Ether frame
-    getEtherMacAddress(localHwAddress);
-    getIpAddress(localIpAddress);
+    char str[20];
+    uint8_t mac[6];
+    uint8_t ip[4];
+    getEtherMacAddress(mac);
+    putsUart0("  HW:    ");
     for (i = 0; i < HW_ADD_LENGTH; i++)
     {
-        ether->destAddress[i] = s->remoteHwAddress[i];
-        ether->sourceAddress[i] = localHwAddress[i];
+        snprintf(str, sizeof(str), "%02"PRIu8, mac[i]);
+        putsUart0(str);
+        if (i < HW_ADD_LENGTH-1)
+            putcUart0(':');
     }
-    ether->frameType = htons(TYPE_IP);
-
-    // IP header
-    ipHeader* ip = (ipHeader*)ether->data; // up to here, ether is populated
-    ip->rev = 0x4;
-    ip->size = 0x5;
-    ip->typeOfService = 0;
-    //length
-    ip->id = 0;
-    ip->flagsAndOffset = 0;
-    ip->ttl = 128;
-    ip->protocol = PROTOCOL_TCP;
-    ip->headerChecksum = 0;
-    // source ip
-    // dest ip
-    // data
+    putcUart0('\n');
+    getIpAddress(ip);
+    putsUart0("  IP:    ");
     for (i = 0; i < IP_ADD_LENGTH; i++)
     {
-        ip->destIp[i] = s->remoteIpAddress[i];
-        ip->sourceIp[i] = localIpAddress[i];
+        snprintf(str, sizeof(str), "%"PRIu8, ip[i]);
+        putsUart0(str);
+        if (i < IP_ADD_LENGTH-1)
+            putcUart0('.');
     }
-    uint8_t ipHeaderLength = ip->size * 4;
-
-    // real work here boys
-    //        |
-    //        V
-    // populating tcp header
-
-    if (dataSize > 0)
-        s->sequenceNumber += dataSize; // update sequence number
+    putcUart0('\n');
+    getIpSubnetMask(ip);
+    putsUart0("  SN:    ");
+    for (i = 0; i < IP_ADD_LENGTH; i++)
+    {
+        snprintf(str, sizeof(str), "%"PRIu8, ip[i]);
+        putsUart0(str);
+        if (i < IP_ADD_LENGTH-1)
+            putcUart0('.');
+    }
+    putcUart0('\n');
+    getIpGatewayAddress(ip);
+    putsUart0("  GW:    ");
+    for (i = 0; i < IP_ADD_LENGTH; i++)
+    {
+        snprintf(str, sizeof(str), "%"PRIu8, ip[i]);
+        putsUart0(str);
+        if (i < IP_ADD_LENGTH-1)
+            putcUart0('.');
+    }
+    putcUart0('\n');
+    getIpDnsAddress(ip);
+    putsUart0("  DNS:   ");
+    for (i = 0; i < IP_ADD_LENGTH; i++)
+    {
+        snprintf(str, sizeof(str), "%"PRIu8, ip[i]);
+        putsUart0(str);
+        if (i < IP_ADD_LENGTH-1)
+            putcUart0('.');
+    }
+    putcUart0('\n');
+    getIpTimeServerAddress(ip);
+    putsUart0("  Time:  ");
+    for (i = 0; i < IP_ADD_LENGTH; i++)
+    {
+        snprintf(str, sizeof(str), "%"PRIu8, ip[i]);
+        putsUart0(str);
+        if (i < IP_ADD_LENGTH-1)
+            putcUart0('.');
+    }
+    putcUart0('\n');
+    getIpMqttBrokerAddress(ip);
+    putsUart0("  MQTT:  ");
+    for (i = 0; i < IP_ADD_LENGTH; i++)
+    {
+        snprintf(str, sizeof(str), "%"PRIu8, ip[i]);
+        putsUart0(str);
+        if (i < IP_ADD_LENGTH-1)
+            putcUart0('.');
+    }
+    putcUart0('\n');
+    if (isEtherLinkUp())
+        putsUart0("  Link is up\n");
     else
-        s->sequenceNumber += 1; // no data, just increment by 1
-
-    // extracting from socket
-    tcpHeader* tcp = (tcpHeader*)((uint8_t*)ip + (ip->size * 4));
-    tcp->sourcePort = htons(s->localPort);
-    tcp->destPort = htons(s->remotePort);
-    tcp->sequenceNumber = htons(s->sequenceNumber);
-    tcp->acknowledgementNumber = htons(s->acknowledgementNumber);
-
-    // data offset and flags
-    uint8_t dataOffset = 20; // TCP header size
-    uint16_t offsetsFlags = (dataOffset & 0xF) << OFS_SHIFT | (flags & 0xFFF);
-    tcp->offsetFields = htons(offsetsFlags);
-
-    // IS THE WINDOW HARD CODED?
-    tcp->windowSize = htons(0xFFFF); // max window size
-
-    //checksum
-    tcpLength = ntohs(ip->length)-ipHeaderLength;
-    copyData = tcp->data;
-    for (j = 0; j < dataSize; j++)
-        copyData[j] = data[j];
-    // 32-bit sum over pseudo-header
-    sum = 0;
-    sumIpWords(ip->sourceIp, 8, &sum);
-    tmp16 = ip->protocol;
-    sum += (tmp16 & 0xff) << 8;
-    sumIpWords(&tcpLength, 2, &sum);
-    // add tcp header
-    tcp->checksum = 0;
-    sumIpWords(tcp, tcpLength, &sum);
-    tcp->checksum = getIpChecksum(sum);
-
-    // urgent pointer (padded cause idk where to get this)
-    tcp->urgentPointer = 0;
-
-    // send packet with size = ether + udp hdr + ip header + udp_size
-    putEtherPacket(ether, sizeof(etherHeader) + ipHeaderLength + tcpLength);
+        putsUart0("  Link is down\n");
 }
+
+void readConfiguration()
+{
+    uint32_t temp;
+    uint8_t* ip;
+
+    temp = readEeprom(EEPROM_IP);
+    if (temp != EEPROM_ERASED)
+    {
+        ip = (uint8_t*)&temp;
+        setIpAddress(ip);
+    }
+    temp = readEeprom(EEPROM_SUBNET_MASK);
+    if (temp != EEPROM_ERASED)
+    {
+        ip = (uint8_t*)&temp;
+        setIpSubnetMask(ip);
+    }
+    temp = readEeprom(EEPROM_GATEWAY);
+    if (temp != EEPROM_ERASED)
+    {
+        ip = (uint8_t*)&temp;
+        setIpGatewayAddress(ip);
+    }
+    temp = readEeprom(EEPROM_DNS);
+    if (temp != EEPROM_ERASED)
+    {
+        ip = (uint8_t*)&temp;
+        setIpDnsAddress(ip);
+    }
+    temp = readEeprom(EEPROM_TIME);
+    if (temp != EEPROM_ERASED)
+    {
+        ip = (uint8_t*)&temp;
+        setIpTimeServerAddress(ip);
+    }
+    temp = readEeprom(EEPROM_MQTT);
+    if (temp != EEPROM_ERASED)
+    {
+        ip = (uint8_t*)&temp;
+        setIpMqttBrokerAddress(ip);
+    }
+}
+
+#define MAX_CHARS 80
+char strInput[MAX_CHARS+1];
+char* token;
+uint8_t count = 0;
+
+uint8_t asciiToUint8(const char str[])
+{
+    uint8_t data;
+    if (str[0] == '0' && tolower(str[1]) == 'x')
+        sscanf(str, "%hhx", &data);
+    else
+        sscanf(str, "%hhu", &data);
+    return data;
+}
+
+void processShell()
+{
+    bool end;
+    char c;
+    uint8_t i;
+    uint8_t ip[IP_ADD_LENGTH];
+    uint32_t* p32;
+    char *topic, *data;
+
+    if (kbhitUart0())
+    {
+        c = getcUart0();
+
+        end = (c == 13) || (count == MAX_CHARS);
+        if (!end)
+        {
+            if ((c == 8 || c == 127) && count > 0)
+                count--;
+            if (c >= ' ' && c < 127)
+                strInput[count++] = c;
+        }
+        else
+        {
+            strInput[count] = '\0';
+            count = 0;
+            token = strtok(strInput, " ");
+            if (strcmp(token, "mqtt") == 0)
+            {
+                token = strtok(NULL, " ");
+                if (strcmp(token, "connect") == 0)
+                {
+                    connectMqtt();
+                }
+                if (strcmp(token, "disconnect") == 0)
+                {
+                    disconnectMqtt();
+                }
+                if (strcmp(token, "publish") == 0)
+                {
+                    topic = strtok(NULL, " ");
+                    data = strtok(NULL, " ");
+                    if (topic != NULL && data != NULL)
+                        publishMqtt(topic, data);
+                }
+                if (strcmp(token, "subscribe") == 0)
+                {
+                    topic = strtok(NULL, " ");
+                    if (topic != NULL)
+                        subscribeMqtt(topic);
+                }
+                if (strcmp(token, "unsubscribe") == 0)
+                {
+                    topic = strtok(NULL, " ");
+                    if (topic != NULL)
+                        unsubscribeMqtt(topic);
+                }
+            }
+            if (strcmp(token, "ip") == 0)
+            {
+                displayConnectionInfo();
+            }
+            if (strcmp(token, "ping") == 0)
+            {
+                for (i = 0; i < IP_ADD_LENGTH; i++)
+                {
+                    token = strtok(NULL, " .");
+                    ip[i] = asciiToUint8(token);
+                }
+                //removed from this version to save space: sendPingRequest(ip)
+            }
+            if (strcmp(token, "reboot") == 0)
+            {
+                NVIC_APINT_R = NVIC_APINT_VECTKEY | NVIC_APINT_SYSRESETREQ;
+            }
+            if (strcmp(token, "set") == 0)
+            {
+                token = strtok(NULL, " ");
+                if (strcmp(token, "ip") == 0)
+                {
+                    for (i = 0; i < IP_ADD_LENGTH; i++)
+                    {
+                        token = strtok(NULL, " .");
+                        ip[i] = asciiToUint8(token);
+                    }
+                    setIpAddress(ip);
+                    p32 = (uint32_t*)ip;
+                    writeEeprom(EEPROM_IP, *p32);
+                }
+                if (strcmp(token, "sn") == 0)
+                {
+                    for (i = 0; i < IP_ADD_LENGTH; i++)
+                    {
+                        token = strtok(NULL, " .");
+                        ip[i] = asciiToUint8(token);
+                    }
+                    setIpSubnetMask(ip);
+                    p32 = (uint32_t*)ip;
+                    writeEeprom(EEPROM_SUBNET_MASK, *p32);
+                }
+                if (strcmp(token, "gw") == 0)
+                {
+                    for (i = 0; i < IP_ADD_LENGTH; i++)
+                    {
+                        token = strtok(NULL, " .");
+                        ip[i] = asciiToUint8(token);
+                    }
+                    setIpGatewayAddress(ip);
+                    p32 = (uint32_t*)ip;
+                    writeEeprom(EEPROM_GATEWAY, *p32);
+                }
+                if (strcmp(token, "dns") == 0)
+                {
+                    for (i = 0; i < IP_ADD_LENGTH; i++)
+                    {
+                        token = strtok(NULL, " .");
+                        ip[i] = asciiToUint8(token);
+                    }
+                    setIpDnsAddress(ip);
+                    p32 = (uint32_t*)ip;
+                    writeEeprom(EEPROM_DNS, *p32);
+                }
+                if (strcmp(token, "time") == 0)
+                {
+                    for (i = 0; i < IP_ADD_LENGTH; i++)
+                    {
+                        token = strtok(NULL, " .");
+                        ip[i] = asciiToUint8(token);
+                    }
+                    setIpTimeServerAddress(ip);
+                    p32 = (uint32_t*)ip;
+                    writeEeprom(EEPROM_TIME, *p32);
+                }
+                if (strcmp(token, "mqtt") == 0)
+                {
+                    for (i = 0; i < IP_ADD_LENGTH; i++)
+                    {
+                        token = strtok(NULL, " .");
+                        ip[i] = asciiToUint8(token);
+                    }
+                    setIpMqttBrokerAddress(ip);
+                    p32 = (uint32_t*)ip;
+                    writeEeprom(EEPROM_MQTT, *p32);
+                }
+            }
+
+            if (strcmp(token, "help") == 0)
+            {
+                putsUart0("Commands:\n");
+                putsUart0("  mqtt ACTION [USER [PASSWORD]]\n");
+                putsUart0("    where ACTION = {connect|disconnect|publish TOPIC DATA\n");
+                putsUart0("                   |subscribe TOPIC|unsubscribe TOPIC}\n");
+                putsUart0("  ip\n");
+                putsUart0("  ping w.x.y.z\n");
+                putsUart0("  reboot\n");
+                putsUart0("  set ip|gw|dns|time|mqtt|sn w.x.y.z\n");
+            }
+        }
+    }
+}
+
+//-----------------------------------------------------------------------------
+// Main
+//-----------------------------------------------------------------------------
+
+// Max packet is calculated as:
+// Ether frame header (18) + Max MTU (1500)
+#define MAX_PACKET_SIZE 1518
+
+int main(void)
+{
+    uint8_t buffer[MAX_PACKET_SIZE];
+    etherHeader *data = (etherHeader*) buffer;
+    socket s;
+
+    // Init controller
+    initHw();
+
+    // Setup UART0
+    initUart0();
+    setUart0BaudRate(115200, 40e6);
+
+    // Init timer
+    initTimer();
+
+    // Init sockets
+    initSockets();
+
+    // Init ethernet interface (eth0)
+    putsUart0("\nStarting eth0\n");
+    initEther(ETHER_UNICAST | ETHER_BROADCAST | ETHER_HALFDUPLEX);
+    setEtherMacAddress(2, 3, 4, 5, 6, 101);  // my x value 
+
+    // Init EEPROM
+    initEeprom();
+    readConfiguration();
+
+    setPinValue(GREEN_LED, 1);
+    waitMicrosecond(100000);
+    setPinValue(GREEN_LED, 0);
+    waitMicrosecond(100000);
+
+    // initialize client as closed
+    setTcpState(0, TCP_CLOSED);
+
+    // Main Loop
+    // RTOS and interrupts would greatly improve this code,
+    // but the goal here is simplicity
+    while (true)
+    {
+        // Terminal processing here
+        processShell();
+
+        // write code snipit to check if send tcp message is working
+        socket *test = getsocket(0);
+        test->remoteIpAddress[0] = 192;
+        test->remoteIpAddress[1] = 168;
+        test->remoteIpAddress[2] = 1;
+        test->remoteIpAddress[3] = 1;
+        test->remotePort = 80;
+        test->localPort = 49152;
+        test->sequenceNumber = random32();
+        test->acknowledgementNumber = 0;
+        test->state = getTcpState(0);
+        sendTcpMessage(data, test, SYN, NULL, 0);
+
+        // TCP pending messages
+        sendTcpPendingMessages(data);
+
+        // Packet processing
+        if (isEtherDataAvailable())
+        {
+            if (isEtherOverflow())
+            {
+                setPinValue(RED_LED, 1);
+                waitMicrosecond(100000);
+                setPinValue(RED_LED, 0);
+            }
+
+            // Get packet
+            getEtherPacket(data, MAX_PACKET_SIZE);
+
+            // Handle ARP request
+            if (isArpRequest(data))
+                sendArpResponse(data);
+
+            // Handle IP datagram
+            if (isIp(data))
+            {
+            	if (isIpUnicast(data))
+            	{
+                    // Handle ICMP ping request
+                    if (isPingRequest(data))
+                    {
+                        sendPingResponse(data);
+                    }
+
+                    // Handle TCP datagram
+                    if (isTcp(data))
+                    {
+                        if (isTcpPortOpen(data))
+                        {
+                            
+                        }
+                        else
+                            sendTcpResponse(data, &s, ACK | RST);
+                    }
+                }
+            }
+        }
+    }
+}
+
+//-----------------------------------------------------------------------------
+// mqtt status flags
+#define MQTT_CONNECTED 0x01
+#define MQTT_SUBSCRIBED 0x02
+#define MQTT_PUBLISH 0x04
+
+void connectMqtt()
+{
+    if (getTcpState(0) == TCP_ESTABLISHED)
+    {
+        uint8_t mqttData[100];
+        uint16_t mqttDataSize = 0;
+        // MQTT connect packet
+        mqttData[mqttDataSize++] = 0x10; // connect
+        mqttData[mqttDataSize++] = 0xF; // remaining length FILL IN LATER
+        mqttData[mqttDataSize++] = 0x00; // protocol name length MSB
+        mqttData[mqttDataSize++] = 0x04; // protocol name length LSB
+        mqttData[mqttDataSize++] = 'M';  // protocol name
+        mqttData[mqttDataSize++] = 'Q';  // protocol name
+        mqttData[mqttDataSize++] = 'T';  // protocol name
+        mqttData[mqttDataSize++] = 'T';  // protocol name
+        mqttData[mqttDataSize++] = 0x04; // protocol level
+        mqttData[mqttDataSize++] = 0x00; // connect flags
+        mqttData[mqttDataSize++] = 0x00; // keep alive MSB
+        mqttData[mqttDataSize++] = 0x3C; // keep alive LSB 60 seconds
+
+        mqttData[mqttDataSize++] = 0x00; // client id length MSB
+        mqttData[mqttDataSize++] = 0x04; // client id length LSB
+        mqttData[mqttDataSize++] = 'T';  // client id
+        mqttData[mqttDataSize++] = 'e';  // client id
+        mqttData[mqttDataSize++] = 's';  // client id
+        mqttData[mqttDataSize++] = 't';  // client id
+        sendTcpMessage(ether, getsocket(0), PSH | ACK, mqttData, mqttDataSize);
+    }
+}
+
+void disconnectMqtt()
+{
+    if (getTcpState(0) == TCP_ESTABLISHED)
+    {
+        uint8_t mqttData[2];
+        // MQTT disconnect packet
+        mqttData[0] = 0xE0; // disconnect
+        mqttData[1] = 0x00; // remaining length
+        sendTcpMessage(ether, getsocket(0), PSH | ACK, mqttData, 2);
+    }
+}
+
+void publishMqtt(char strTopic[], char strData[])
+{
+}
+
+void subscribeMqtt(char strTopic[])
+{
+}
+
+void unsubscribeMqtt(char strTopic[])
+{
+}
+
+/*
+create a bit splicing algorithm to convert a data array into an octet array thatll be the payload for an MQTT packet. 
+basically each array element will have 8 bits, bits 0 to 6 will hold some of the data, bit 7 will hold a 1 or 0 to 
+indicate that the next byte is populated or not (continuation bit). if bit 7 is 1 then the next array element holds 
+data, if bit 7 is 0 then that is the last array element with data. note: the bytes are big endian
+*/
+void bitSplicing(uint8_t data[], uint8_t size, uint8_t payload[])
+{
+    //find the size of data in bits 
+    uint16_t dataSize = size * 8;
+    // divide by 7 to get the number of octets needed to store the data
+    uint16_t payloadSize = dataSize / 7;
+    // if there is a remainder then add 1 to the payload size
+    if (dataSize % 7 != 0) payloadSize++;
+    // loop through the data array grabbing 7 bits at a time and storing them in the payload array
+    // the 8th bit will be the continuation bit, last byte will have a 0 in the 8th bit
+    uint16_t i = 0;
+    uint16_t j = 0;
+    uint8_t bitCount = 0;
+    uint8_t bit = 0;
+    while (i < dataSize)
+    {
+        // grab the bit from the data array
+        bit = (data[i / 8] << (i % 8)) & 0x01;
+        // store the bit in the payload array
+        payload[j] |= bit >> bitCount;
+        // increment the bit count
+        bitCount++;
+        // if the bit count is 7 then reset the bit count and increment the payload index
+        if (bitCount == 7)
+        {
+            // if there is a next byte then set the continuation bit to 1
+            if (i < dataSize - 1) payload[j] |= 0x80; // set the 8th bit to 1
+            bitCount = 0;
+            j++;
+        }
+        // increment the data index
+        i++;
+    }
+}
+
+
+// Ethernet Framework for Projects 1 and 2
+// Spring 2025
+// Jason Losh
+
+//-----------------------------------------------------------------------------
+// Hardware Target
+//-----------------------------------------------------------------------------
+
+// Target Platform: EK-TM4C123GXL w/ ENC28J60
+// Target uC:       TM4C123GH6PM
+// System Clock:    40 MHz
+
+// Hardware configuration:
+// ENC28J60 Ethernet controller on SPI0
+//   MOSI (SSI0Tx) on PA5
+//   MISO (SSI0Rx) on PA4
+//   SCLK (SSI0Clk) on PA2
+//   ~CS (SW controlled) on PA3
+//   WOL on PB3
+//   INT on PC6
+
+// Pinning for IoT projects with wireless modules:
+// N24L01+ RF transceiver
+//   MOSI (SSI0Tx) on PA5
+//   MISO (SSI0Rx) on PA4
+//   SCLK (SSI0Clk) on PA2
+//   ~CS on PE0
+//   INT on PB2
+// Xbee module
+//   DIN (UART1TX) on PC5
+//   DOUT (UART1RX) on PC4
+
+//-----------------------------------------------------------------------------
+// Device includes, defines, and assembler directives
+//-----------------------------------------------------------------------------
+
+#include <inttypes.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+#include "tm4c123gh6pm.h"
+#include "clock.h"
+#include "eeprom.h"
+#include "gpio.h"
+#include "spi0.h"
+#include "uart0.h"
+#include "wait.h"
+#include "timer.h"
+#include "eth0.h"
+#include "arp.h"
+#include "ip.h"
+#include "icmp.h"
+#include "udp.h"
+#include "tcp.h"
+#include "mqtt.h"
+
+// Pins
+#define RED_LED PORTF,1
+#define BLUE_LED PORTF,2
+#define GREEN_LED PORTF,3
+#define PUSH_BUTTON PORTF,4
+
+// EEPROM Map
+#define EEPROM_DHCP        1
+#define EEPROM_IP          2
+#define EEPROM_SUBNET_MASK 3
+#define EEPROM_GATEWAY     4
+#define EEPROM_DNS         5
+#define EEPROM_TIME        6
+#define EEPROM_MQTT        7
+#define EEPROM_ERASED      0xFFFFFFFF
+
+//-----------------------------------------------------------------------------
+// Subroutines                
+//-----------------------------------------------------------------------------
+
+// Initialize Hardware
+void initHw()
+{
+    // Initialize system clock to 40 MHz
+    initSystemClockTo40Mhz();
+
+    // Enable clocks
+    enablePort(PORTF);
+    _delay_cycles(3);
+
+    // Configure LED and pushbutton pins
+    selectPinPushPullOutput(RED_LED);
+    selectPinPushPullOutput(GREEN_LED);
+    selectPinPushPullOutput(BLUE_LED);
+    selectPinDigitalInput(PUSH_BUTTON);
+    enablePinPullup(PUSH_BUTTON);
+}
+
+void displayConnectionInfo()
+{
+    uint8_t i;
+    char str[20];
+    uint8_t mac[6];
+    uint8_t ip[4];
+    getEtherMacAddress(mac);
+    putsUart0("  HW:    ");
+    for (i = 0; i < HW_ADD_LENGTH; i++)
+    {
+        snprintf(str, sizeof(str), "%02"PRIu8, mac[i]);
+        putsUart0(str);
+        if (i < HW_ADD_LENGTH-1)
+            putcUart0(':');
+    }
+    putcUart0('\n');
+    getIpAddress(ip);
+    putsUart0("  IP:    ");
+    for (i = 0; i < IP_ADD_LENGTH; i++)
+    {
+        snprintf(str, sizeof(str), "%"PRIu8, ip[i]);
+        putsUart0(str);
+        if (i < IP_ADD_LENGTH-1)
+            putcUart0('.');
+    }
+    putcUart0('\n');
+    getIpSubnetMask(ip);
+    putsUart0("  SN:    ");
+    for (i = 0; i < IP_ADD_LENGTH; i++)
+    {
+        snprintf(str, sizeof(str), "%"PRIu8, ip[i]);
+        putsUart0(str);
+        if (i < IP_ADD_LENGTH-1)
+            putcUart0('.');
+    }
+    putcUart0('\n');
+    getIpGatewayAddress(ip);
+    putsUart0("  GW:    ");
+    for (i = 0; i < IP_ADD_LENGTH; i++)
+    {
+        snprintf(str, sizeof(str), "%"PRIu8, ip[i]);
+        putsUart0(str);
+        if (i < IP_ADD_LENGTH-1)
+            putcUart0('.');
+    }
+    putcUart0('\n');
+    getIpDnsAddress(ip);
+    putsUart0("  DNS:   ");
+    for (i = 0; i < IP_ADD_LENGTH; i++)
+    {
+        snprintf(str, sizeof(str), "%"PRIu8, ip[i]);
+        putsUart0(str);
+        if (i < IP_ADD_LENGTH-1)
+            putcUart0('.');
+    }
+    putcUart0('\n');
+    getIpTimeServerAddress(ip);
+    putsUart0("  Time:  ");
+    for (i = 0; i < IP_ADD_LENGTH; i++)
+    {
+        snprintf(str, sizeof(str), "%"PRIu8, ip[i]);
+        putsUart0(str);
+        if (i < IP_ADD_LENGTH-1)
+            putcUart0('.');
+    }
+    putcUart0('\n');
+    getIpMqttBrokerAddress(ip);
+    putsUart0("  MQTT:  ");
+    for (i = 0; i < IP_ADD_LENGTH; i++)
+    {
+        snprintf(str, sizeof(str), "%"PRIu8, ip[i]);
+        putsUart0(str);
+        if (i < IP_ADD_LENGTH-1)
+            putcUart0('.');
+    }
+    putcUart0('\n');
+    if (isEtherLinkUp())
+        putsUart0("  Link is up\n");
+    else
+        putsUart0("  Link is down\n");
+}
+
+void readConfiguration()
+{
+    uint32_t temp;
+    uint8_t* ip;
+
+    temp = readEeprom(EEPROM_IP);
+    if (temp != EEPROM_ERASED)
+    {
+        ip = (uint8_t*)&temp;
+        setIpAddress(ip);
+    }
+    temp = readEeprom(EEPROM_SUBNET_MASK);
+    if (temp != EEPROM_ERASED)
+    {
+        ip = (uint8_t*)&temp;
+        setIpSubnetMask(ip);
+    }
+    temp = readEeprom(EEPROM_GATEWAY);
+    if (temp != EEPROM_ERASED)
+    {
+        ip = (uint8_t*)&temp;
+        setIpGatewayAddress(ip);
+    }
+    temp = readEeprom(EEPROM_DNS);
+    if (temp != EEPROM_ERASED)
+    {
+        ip = (uint8_t*)&temp;
+        setIpDnsAddress(ip);
+    }
+    temp = readEeprom(EEPROM_TIME);
+    if (temp != EEPROM_ERASED)
+    {
+        ip = (uint8_t*)&temp;
+        setIpTimeServerAddress(ip);
+    }
+    temp = readEeprom(EEPROM_MQTT);
+    if (temp != EEPROM_ERASED)
+    {
+        ip = (uint8_t*)&temp;
+        setIpMqttBrokerAddress(ip);
+    }
+}
+
+#define MAX_CHARS 80
+char strInput[MAX_CHARS+1];
+char* token;
+uint8_t count = 0;
+
+uint8_t asciiToUint8(const char str[])
+{
+    uint8_t data;
+    if (str[0] == '0' && tolower(str[1]) == 'x')
+        sscanf(str, "%hhx", &data);
+    else
+        sscanf(str, "%hhu", &data);
+    return data;
+}
+
+void processShell()
+{
+    bool end;
+    char c;
+    uint8_t i;
+    uint8_t ip[IP_ADD_LENGTH];
+    uint32_t* p32;
+    char *topic, *data;
+
+    if (kbhitUart0())
+    {
+        c = getcUart0();
+
+        end = (c == 13) || (count == MAX_CHARS);
+        if (!end)
+        {
+            if ((c == 8 || c == 127) && count > 0)
+                count--;
+            if (c >= ' ' && c < 127)
+                strInput[count++] = c;
+        }
+        else
+        {
+            strInput[count] = '\0';
+            count = 0;
+            token = strtok(strInput, " ");
+            if (strcmp(token, "mqtt") == 0)
+            {
+                token = strtok(NULL, " ");
+                if (strcmp(token, "connect") == 0)
+                {
+                    connectMqtt();
+                }
+                if (strcmp(token, "disconnect") == 0)
+                {
+                    disconnectMqtt();
+                }
+                if (strcmp(token, "publish") == 0)
+                {
+                    topic = strtok(NULL, " ");
+                    data = strtok(NULL, " ");
+                    if (topic != NULL && data != NULL)
+                        publishMqtt(topic, data);
+                }
+                if (strcmp(token, "subscribe") == 0)
+                {
+                    topic = strtok(NULL, " ");
+                    if (topic != NULL)
+                        subscribeMqtt(topic);
+                }
+                if (strcmp(token, "unsubscribe") == 0)
+                {
+                    topic = strtok(NULL, " ");
+                    if (topic != NULL)
+                        unsubscribeMqtt(topic);
+                }
+            }
+            if (strcmp(token, "ip") == 0)
+            {
+                displayConnectionInfo();
+            }
+            if (strcmp(token, "ping") == 0)
+            {
+                for (i = 0; i < IP_ADD_LENGTH; i++)
+                {
+                    token = strtok(NULL, " .");
+                    ip[i] = asciiToUint8(token);
+                }
+                //removed from this version to save space: sendPingRequest(ip)
+            }
+            if (strcmp(token, "reboot") == 0)
+            {
+                NVIC_APINT_R = NVIC_APINT_VECTKEY | NVIC_APINT_SYSRESETREQ;
+            }
+            if (strcmp(token, "set") == 0)
+            {
+                token = strtok(NULL, " ");
+                if (strcmp(token, "ip") == 0)
+                {
+                    for (i = 0; i < IP_ADD_LENGTH; i++)
+                    {
+                        token = strtok(NULL, " .");
+                        ip[i] = asciiToUint8(token);
+                    }
+                    setIpAddress(ip);
+                    p32 = (uint32_t*)ip;
+                    writeEeprom(EEPROM_IP, *p32);
+                }
+                if (strcmp(token, "sn") == 0)
+                {
+                    for (i = 0; i < IP_ADD_LENGTH; i++)
+                    {
+                        token = strtok(NULL, " .");
+                        ip[i] = asciiToUint8(token);
+                    }
+                    setIpSubnetMask(ip);
+                    p32 = (uint32_t*)ip;
+                    writeEeprom(EEPROM_SUBNET_MASK, *p32);
+                }
+                if (strcmp(token, "gw") == 0)
+                {
+                    for (i = 0; i < IP_ADD_LENGTH; i++)
+                    {
+                        token = strtok(NULL, " .");
+                        ip[i] = asciiToUint8(token);
+                    }
+                    setIpGatewayAddress(ip);
+                    p32 = (uint32_t*)ip;
+                    writeEeprom(EEPROM_GATEWAY, *p32);
+                }
+                if (strcmp(token, "dns") == 0)
+                {
+                    for (i = 0; i < IP_ADD_LENGTH; i++)
+                    {
+                        token = strtok(NULL, " .");
+                        ip[i] = asciiToUint8(token);
+                    }
+                    setIpDnsAddress(ip);
+                    p32 = (uint32_t*)ip;
+                    writeEeprom(EEPROM_DNS, *p32);
+                }
+                if (strcmp(token, "time") == 0)
+                {
+                    for (i = 0; i < IP_ADD_LENGTH; i++)
+                    {
+                        token = strtok(NULL, " .");
+                        ip[i] = asciiToUint8(token);
+                    }
+                    setIpTimeServerAddress(ip);
+                    p32 = (uint32_t*)ip;
+                    writeEeprom(EEPROM_TIME, *p32);
+                }
+                if (strcmp(token, "mqtt") == 0)
+                {
+                    for (i = 0; i < IP_ADD_LENGTH; i++)
+                    {
+                        token = strtok(NULL, " .");
+                        ip[i] = asciiToUint8(token);
+                    }
+                    setIpMqttBrokerAddress(ip);
+                    p32 = (uint32_t*)ip;
+                    writeEeprom(EEPROM_MQTT, *p32);
+                }
+            }
+
+            if (strcmp(token, "help") == 0)
+            {
+                putsUart0("Commands:\n");
+                putsUart0("  mqtt ACTION [USER [PASSWORD]]\n");
+                putsUart0("    where ACTION = {connect|disconnect|publish TOPIC DATA\n");
+                putsUart0("                   |subscribe TOPIC|unsubscribe TOPIC}\n");
+                putsUart0("  ip\n");
+                putsUart0("  ping w.x.y.z\n");
+                putsUart0("  reboot\n");
+                putsUart0("  set ip|gw|dns|time|mqtt|sn w.x.y.z\n");
+            }
+        }
+    }
+}
+
+//-----------------------------------------------------------------------------
+// Main
+//-----------------------------------------------------------------------------
+
+// Max packet is calculated as:
+// Ether frame header (18) + Max MTU (1500)
+#define MAX_PACKET_SIZE 1518
+
+int main(void)
+{
+    uint8_t buffer[MAX_PACKET_SIZE];
+    etherHeader *data = (etherHeader*) buffer;
+    socket s;
+
+    // Init controller
+    initHw();
+
+    // Setup UART0
+    initUart0();
+    setUart0BaudRate(115200, 40e6);
+
+    // Init timer
+    initTimer();
+
+    // Init sockets
+    initSockets();
+
+    // Init ethernet interface (eth0)
+    putsUart0("\nStarting eth0\n");
+    initEther(ETHER_UNICAST | ETHER_BROADCAST | ETHER_HALFDUPLEX);
+    setEtherMacAddress(2, 3, 4, 5, 6, 101);  // my x value 
+
+    // Init EEPROM
+    initEeprom();
+    readConfiguration();
+
+    setPinValue(GREEN_LED, 1);
+    waitMicrosecond(100000);
+    setPinValue(GREEN_LED, 0);
+    waitMicrosecond(100000);
+
+    // initialize client as closed
+    setTcpState(0, TCP_CLOSED);
+
+    // Main Loop
+    // RTOS and interrupts would greatly improve this code,
+    // but the goal here is simplicity
+    while (true)
+    {
+        // Terminal processing here
+        processShell();
+
+        // write code snipit to check if send tcp message is working
+        socket *test = getsocket(0);
+        test->remoteIpAddress[0] = 192;
+        test->remoteIpAddress[1] = 168;
+        test->remoteIpAddress[2] = 1;
+        test->remoteIpAddress[3] = 1;
+        test->remotePort = 80;
+        test->localPort = 49152;
+        test->sequenceNumber = random32();
+        test->acknowledgementNumber = 0;
+        test->state = getTcpState(0);
+        sendTcpMessage(data, test, SYN, NULL, 0);
+
+        // TCP pending messages
+        sendTcpPendingMessages(data);
+
+        // Packet processing
+        if (isEtherDataAvailable())
+        {
+            if (isEtherOverflow())
+            {
+                setPinValue(RED_LED, 1);
+                waitMicrosecond(100000);
+                setPinValue(RED_LED, 0);
+            }
+
+            // Get packet
+            getEtherPacket(data, MAX_PACKET_SIZE);
+
+            // Handle ARP request
+            if (isArpRequest(data))
+                sendArpResponse(data);
+
+            // Handle IP datagram
+            if (isIp(data))
+            {
+            	if (isIpUnicast(data))
+            	{
+                    // Handle ICMP ping request
+                    if (isPingRequest(data))
+                    {
+                        sendPingResponse(data);
+                    }
+
+                    // Handle TCP datagram
+                    if (isTcp(data))
+                    {
+                        if (isTcpPortOpen(data))
+                        {
+                            
+                        }
+                        else
+                            sendTcpResponse(data, &s, ACK | RST);
+                    }
+                }
+            }
+        }
+    }
+}
+
