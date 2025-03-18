@@ -246,6 +246,7 @@ void processShell()
     if (kbhitUart0())
     {
         c = getcUart0();
+        putcUart0(c);
 
         end = (c == 13) || (count == MAX_CHARS);
         if (!end)
@@ -295,6 +296,37 @@ void processShell()
             {
                 displayConnectionInfo();
             }
+            if (strcmp(token, "Status") == 0)
+            {
+                uint8_t TCPstate = getTcpState(0);
+                uint8_t MQTTcon = getTcpState(1);
+                putsUart0("TCP State: ");
+                switch (TCPstate)
+                {
+                case TCP_CLOSED:
+                    putsUart0("Closed\n");
+                    break;
+                case TCP_ESTABLISHED:
+                    putsUart0("Established\n");
+                    break;
+                default:
+                    putsUart0("neither\n");
+                    break;
+                }
+                putsUart0("MQTT State: ");
+                switch (MQTTcon)
+                {
+                case MQTT_UNCONNECTED:
+                    putsUart0("Not Connected\n");
+                    break;
+                case MQTT_CONNECTED:
+                    putsUart0("Connected\n");
+                    break;
+                case MQTT_SUBSCRIBED:
+                    putsUart0("Subscribed\n");
+                    break;
+                }
+            }
             if (strcmp(token, "ping") == 0)
             {
                 for (i = 0; i < IP_ADD_LENGTH; i++)
@@ -302,7 +334,6 @@ void processShell()
                     token = strtok(NULL, " .");
                     ip[i] = asciiToUint8(token);
                 }
-                //removed from this version to save space: sendPingRequest(ip)
             }
             if (strcmp(token, "reboot") == 0)
             {
@@ -424,7 +455,7 @@ int main(void)
     // Init ethernet interface (eth0)
     putsUart0("\nStarting eth0\n");
     initEther(ETHER_UNICAST | ETHER_BROADCAST | ETHER_HALFDUPLEX);
-    setEtherMacAddress(2, 3, 4, 5, 6, 101);  // my x value 
+    setEtherMacAddress(2, 3, 4, 5, 6, 101);  // my x value
 
     // Init EEPROM
     initEeprom();
@@ -435,29 +466,22 @@ int main(void)
     setPinValue(GREEN_LED, 0);
     waitMicrosecond(100000);
 
-    // initialize client as closed
-    setTcpState(0, TCP_CLOSED);
-
     // Main Loop
     // RTOS and interrupts would greatly improve this code,
     // but the goal here is simplicity
+
+    // send ARP request to MQTT broker
+    uint8_t ip[4];
+    getIpAddress(ip);
+    uint8_t mqttip[4];
+    getIpMqttBrokerAddress(mqttip);
+    sendArpRequest(data, ip, mqttip);
+
     while (true)
     {
+
         // Terminal processing here
         processShell();
-
-        // write code snipit to check if send tcp message is working
-        socket *test = getsocket(0);
-        test->remoteIpAddress[0] = 192;
-        test->remoteIpAddress[1] = 168;
-        test->remoteIpAddress[2] = 1;
-        test->remoteIpAddress[3] = 1;
-        test->remotePort = 80;
-        test->localPort = 49152;
-        test->sequenceNumber = random32();
-        test->acknowledgementNumber = 0;
-        test->state = getTcpState(0);
-        sendTcpMessage(data, test, SYN, NULL, 0);
 
         // TCP pending messages
         sendTcpPendingMessages(data);
@@ -482,8 +506,8 @@ int main(void)
             // Handle IP datagram
             if (isIp(data))
             {
-            	if (isIpUnicast(data))
-            	{
+                if (isIpUnicast(data))
+                {
                     // Handle ICMP ping request
                     if (isPingRequest(data))
                     {
@@ -495,7 +519,7 @@ int main(void)
                     {
                         if (isTcpPortOpen(data))
                         {
-                            
+                            //processTcpResponse(data);
                         }
                         else
                             sendTcpResponse(data, &s, ACK | RST);
