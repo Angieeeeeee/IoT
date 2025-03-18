@@ -471,10 +471,13 @@ int main(void)
     // but the goal here is simplicity
 
     // send ARP request to MQTT broker
+    //
     uint8_t ip[4];
     getIpAddress(ip);
     uint8_t mqttip[4];
     getIpMqttBrokerAddress(mqttip);
+
+    // Instead of sending ARP request at the start, create a command tcp open that sends the arp request
     sendArpRequest(data, ip, mqttip);
 
     while (true)

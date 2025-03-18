@@ -162,12 +162,7 @@ void sendTcpPendingMessages(etherHeader *ether)
             break;
         case TCP_FIN_WAIT_1:
             // I sent FIN ACK and am waiting for ACK
-            if (isTcpAck(ether))
-            {
-                socket *s = getsocket(0);
-                s->acknowledgementNumber += 1;
-                setTcpState(0, TCP_FIN_WAIT_2);
-            }
+            processTcpResponse(ether);
             break;
         case TCP_FIN_WAIT_2:
             // if its a FIN ACK will send ACK and close
@@ -237,10 +232,13 @@ void processTcpResponse(etherHeader *ether)
 //                    setTcpState(0, TCP_CLOSED);
                 }
                 // I sent a FIN ACK and got an ACK and then FIN ACK now sending ACK back
-                else if (state == TCP_FIN_WAIT_2)
+                else if (state == TCP_FIN_WAIT_1)
                 {
                     s->acknowledgementNumber += 1;
                     sendTcpMessage(ether, s, ACK, NULL, 0);
+                    // s->sequenceNumber += 1;
+                    sendTcpMessage(ether, s, FIN | ACK, NULL, 0);
+                    // s->sequenceNumber += 1;
                     setTcpState(0, TCP_CLOSED);
                 }
             }
@@ -260,19 +258,20 @@ void processTcpResponse(etherHeader *ether)
                 }
                 else if (flag == 3) // PUBLISH
                 {
+                    putsUart0("Hey I received a publish message\n");
                     // print out the topic and data
-                    uint16_t topicLength = buffer[3] << 8 | buffer[4];
-                    uint16_t dataLength = dataSize - topicLength - 5;
+                    uint16_t topicLength = buffer[2] << 8 | buffer[3];
+                    uint16_t dataLength = buffer[1] - (topicLength + 2);
                     char topic[100] = {0};
                     char data[100] = {0};
                     uint16_t i;
                     for (i = 0; i < topicLength; i++)
                     {
-                        topic[i] = buffer[i + 5];
+                        topic[i] = buffer[i + 4];
                     }
                     for (i = 0; i < dataLength; i++)
                     {
-                        data[i] = buffer[i + 5 + topicLength];
+                        data[i] = buffer[i + 4 + topicLength];
                     }
                     putsUart0(topic);
                     putcUart0(' ');
@@ -290,15 +289,11 @@ void processTcpResponse(etherHeader *ether)
                 {
 
                 }
-                else if (flag == 9) // SUBACK
-                {
-
-                }
                 else if (flag == 11) // UNSUBACK
                 {
-
+                    setTcpState(1, MQTT_CONNECTED);
                 }
-                else return;
+                //else return;
                 s->acknowledgementNumber += dataSize; // update ack number
                 sendTcpMessage(ether, s, ACK, NULL, 0);
             }

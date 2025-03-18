@@ -50,6 +50,11 @@ typedef struct _tcpHeader // 20 or more bytes
 #define TCP_LAST_ACK 9
 #define TCP_TIME_WAIT 10
 
+// MQTT states
+#define MQTT_UNCONNECTED 0
+#define MQTT_CONNECTED 1
+#define MQTT_SUBSCRIBED 2
+
 // TCP offset/flags
 #define FIN 0x0001
 #define SYN 0x0002
@@ -68,13 +73,14 @@ typedef struct _tcpHeader // 20 or more bytes
 
 void setTcpState(uint8_t instance, uint8_t state);
 uint8_t getTcpState(uint8_t instance);
+socket *getsocket(uint8_t instance);
 
 bool isTcp(etherHeader *ether);
 bool isTcpSyn(etherHeader *ether);
 bool isTcpAck(etherHeader *ether);
 
 void sendTcpPendingMessages(etherHeader *ether);
-void processDhcpResponse(etherHeader *ether);
+void processTcpResponse(etherHeader *ether);
 void processTcpArpResponse(etherHeader *ether);
 
 void setTcpPortList(uint16_t ports[], uint8_t count);

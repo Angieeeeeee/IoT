@@ -79,10 +79,12 @@ void disconnectMqtt()
         uint8_t buffer[MAX_PACKET_SIZE];
         etherHeader *data = (etherHeader*) buffer;
         socket *s = getsocket(0);
-        sendTcpMessage(data, s, FIN | PSH | ACK, mqttData, 2);
+        sendTcpMessage(data, s, PSH | ACK, mqttData, 2);
+
         // increment sequence number cause its a handshake situation
-        s->sequenceNumber += 1;
+        //s->sequenceNumber += 2; // maybe += 3
         setTcpState(0, TCP_FIN_WAIT_1);
+        setTcpState(1, MQTT_UNCONNECTED);
     }
 }
 
