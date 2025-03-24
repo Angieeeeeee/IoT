@@ -42,6 +42,14 @@ socket sockets[MAX_TCP_PORTS];
 // Subroutines
 //-----------------------------------------------------------------------------
 
+// Instead of sending ARP request at the start, create a command tcp open that sends the arp request
+void tcpOpen(void)
+{
+    uint8_t mqttip[4];
+    getIpMqttBrokerAddress(mqttip);
+    sendArpRequest(0, mqttip);
+}
+
 // Set TCP state
 void setTcpState(uint8_t instance, uint8_t state)
 {
@@ -226,10 +234,6 @@ void processTcpResponse(etherHeader *ether)
                     sendTcpMessage(ether, s, FIN | ACK, NULL, 0);
                     s->sequenceNumber += 1;
                     setTcpState(0, TCP_CLOSE_WAIT);
-//                    sendTcpMessage(ether, s, ACK, NULL, 0);
-//                    sendTcpMessage(ether, s, FIN | ACK, NULL, 0);
-//                    s->sequenceNumber += 2;
-//                    setTcpState(0, TCP_CLOSED);
                 }
                 // I sent a FIN ACK and got an ACK and then FIN ACK now sending ACK back
                 else if (state == TCP_FIN_WAIT_1)
@@ -258,7 +262,7 @@ void processTcpResponse(etherHeader *ether)
                 }
                 else if (flag == 3) // PUBLISH
                 {
-                    putsUart0("Hey I received a publish message\n");
+                    // putsUart0("Hey I received a publish message\n");
                     // print out the topic and data
                     uint16_t topicLength = buffer[2] << 8 | buffer[3];
                     uint16_t dataLength = buffer[1] - (topicLength + 2);

@@ -476,8 +476,6 @@ int main(void)
     getIpAddress(ip);
     uint8_t mqttip[4];
     getIpMqttBrokerAddress(mqttip);
-
-    // Instead of sending ARP request at the start, create a command tcp open that sends the arp request
     sendArpRequest(data, ip, mqttip);
 
     while (true)

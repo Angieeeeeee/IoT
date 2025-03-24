@@ -88,12 +88,6 @@ void disconnectMqtt()
     }
 }
 
-
-
-
-
-
-
 void publishMqtt(char strTopic[], char strData[])
 {
     if (getTcpState(0) == TCP_ESTABLISHED)
